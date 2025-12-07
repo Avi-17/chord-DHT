@@ -35,7 +35,6 @@ def _is_between(a, x, b):
     if a < b:
         return a < x <= b
     else:
-        # wrap-around
         return x > a or x <= b
 
 def lookup_successor(node, contact_addr, keyID):

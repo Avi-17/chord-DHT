@@ -63,7 +63,7 @@ class Node:
             return
 
         with self.lock:
-            old_pred = self.predecessor if self.predecessor is not None else self.address
+            old_pred = self.predecessor
             self.predecessor = new_node
             self.predecessor_id = new_id
 
@@ -99,7 +99,7 @@ class Node:
             except Exception:
                 pass
             return
-        #first element is connectionType, req[1] should be peer address (ip,port)
+        #req[0]->conn type, req[1]->addr(ip, port)
         try:
             connectionType = req[0]
         except Exception:
@@ -109,18 +109,18 @@ class Node:
                 pass
             return
 
-        #Peer join req type:0
+        #Peer join req (type:0)
         if connectionType == 0:
             self.handle_join_request(conn, addr, req)
             self.print_menu()
-        # Client upload/download (type 1)
+        # Client upload/download (type:1)
         elif connectionType == 1:
             try:
                 filemanager.transfer_file(self, conn, addr, req)
             except Exception:
                 pass
             self.print_menu()
-        # Ping (type 2) -> return my predecessor
+        # Ping (type:2)- return predecessor
         elif connectionType == 2:
             try:
                 conn.sendall(pickle.dumps(self.predecessor))
@@ -142,7 +142,7 @@ class Node:
                 conn.sendall(pickle.dumps(self.successor))
             except Exception:
                 pass
-        # Request successor list (type 6)
+        # Request successor list (type:6)
         elif connectionType == 6:
             try:
                 conn.sendall(pickle.dumps(self.successor_list))
@@ -159,7 +159,10 @@ class Node:
     def sendJoinRequest(self, ip, port):
         bootstrap = (ip, port)
         #ask bootstrap for successor of node's id
-        recv = self.getSuccessor(bootstrap, self.id)
+        succ = self.getSuccessor(bootstrap, self.id)
+        self.successor = succ
+        self.successor_id = getHash(addr)
+        rpc_send(self.successor, ['notify', self.address])
         if not recv:
             print("Couldn't connect to bootstrap")
             return
