@@ -1,484 +1,569 @@
 import socket
 import threading
 import pickle
-import time
-import sys
-import os
 import hashlib
-from collections import OrderedDict
-from networking import rpc_send, recv_all
-from dht_utils import getHash, _is_between, update_successor_list, lookup_successor
-import filemanager
+import os
+import sys
+import time
+import random
+import base64
 
+# ==============================================================================
+# CONFIGURATION & CONSTANTS
+# ==============================================================================
+M = 10  # Size of the Chord ring identifier space (2^10 = 1024 IDs)
+BUFFER_SIZE = 4096
 
-#------DEFAULT VALUES ---------------
-DEFAULT_IP = "127.0.0.1" #localhost
-DEFAULT_PORT = 2000
-RECV_BUFFER = 4096  #receiver buffer size
+def get_sha1_hash(key_str):
+    """
+    Helper: Generates a SHA-1 hash of the input string and maps it 
+    to the ID space 2^M.
+    """
+    result = hashlib.sha1(key_str.encode())
+    return int(result.hexdigest(), 16) % (2**M)
 
-MAX_BITS = 10
-MAX_NODES = 2**MAX_BITS
+# ==============================================================================
+# MODULE 1: SECURITY LAYER
+# Implements File Integrity (Hashing) and End-to-End Encryption (Placeholder/Basic)
+# ==============================================================================
+class SecurityUtils:
+    
+    # --- Functionality: File Integrity Check ---
+    @staticmethod
+    def calculate_file_hash(data_bytes):
+        """
+        Calculates SHA-256 hash of file data for integrity verification.
+        """
+        sha256_hash = hashlib.sha256()
+        sha256_hash.update(data_bytes)
+        return sha256_hash.hexdigest()
 
-SUCCESSOR_LIST_SIZE = 10
-STABILIZE_INTERVAL= 2.0
-FIX_FINGERS_INTERVAL = 3.0
-PING_INTERVAL = 2.0
+    # --- Functionality: End-to-End Encryption (E2EE) ---
+    @staticmethod
+    def encrypt_data(data_bytes, key="secret_key"):
+        """
+        Basic XOR encryption for demonstration. 
+        In production, use libraries like 'cryptography.fernet'.
+        """
+        key_bytes = key.encode()
+        encrypted = bytearray()
+        for i, byte in enumerate(data_bytes):
+            encrypted.append(byte ^ key_bytes[i % len(key_bytes)])
+        return bytes(encrypted)
 
+    @staticmethod
+    def decrypt_data(data_bytes, key="secret_key"):
+        """
+        Decryption logic (Symmetric XOR).
+        """
+        return SecurityUtils.encrypt_data(data_bytes, key)
+
+# ==============================================================================
+# MAIN CLASS: CHORD NODE
+# ==============================================================================
 class Node:
-    def __init__(self, ip: str, port: int):
+    def __init__(self, ip, port, known_node_ip=None, known_node_port=None):
         self.ip = ip
-        self.port = port
-        self.address = (ip, port)
-        self.id = getHash(f"{ip}:{port}")
-        self.m_bits = MAX_BITS
-        self.predecessor = self.address
-        self.predecessor_id = self.id
-        self.successor = self.address
-        self.successor_id = self.id
-        self.successor_list = [self.address]
-        self.finger_table = OrderedDict()
-        self.filename_list = []
-        self.stop = False              #if True all bg processes stops
-        self.last_fix_index = 0         #one finger updated per iteration
-        self.lock = threading.Lock()    #Prevents race conditions between threads
-
-        try:
-            self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM) #IPv4, TCP
-            self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server.bind((self.ip, self.port))  #specify IP and port
-            self.server.listen()
-        except socket.error as e:
-            print("Socket bind/listen failed:", e)
-            raise 
+        self.port = int(port)
+        self.address = (self.ip, self.port)
         
-    def handle_join_request(self, conn, addr, req):
-        try:
-            new_node = req[1]           # (ip, port) of joining node
-            new_id = getHash(f"{new_node[0]}:{new_node[1]}")
-        except Exception:
-            try:
-                conn.sendall(pickle.dumps([None]))
-            except Exception:
-                pass
-            return
-
-        with self.lock:
-            old_pred = self.predecessor
-            self.predecessor = new_node
-            self.predecessor_id = new_id
-
-        try:
-            conn.sendall(pickle.dumps([old_pred]))
-        except Exception:
-            pass
-
-        try:
-            self.updateFTable()
-        except Exception:
-            pass
-        try:
-            self.updateOtherFTables()
-        except Exception:
-            pass
-    
-    #--------------------------------RPC HANDLERS--------------------------------
-    def listen_loop(self):
-        while not self.stop:
-            try:
-                conn, addr = self.server.accept()
-                conn.settimeout(10.0)
-                threading.Thread(target=self.connection_thread, args=(conn, addr), daemon=True).start() #start a new thread to handle this connection
-            except Exception:
-                continue
-
-    def connection_thread(self, conn, addr):
-        req = recv_all(conn)
-        if req is None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return
-        #req[0]->conn type, req[1]->addr(ip, port)
-        try:
-            connectionType = req[0]
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return
-
-        #Peer join req (type:0)
-        if connectionType == 0:
-            self.handle_join_request(conn, addr, req)
-            self.print_menu()
-        # Client upload/download (type:1)
-        elif connectionType == 1:
-            try:
-                filemanager.transfer_file(self, conn, addr, req)
-            except Exception:
-                pass
-            self.print_menu()
-        # Ping (type:2)- return predecessor
-        elif connectionType == 2:
-            try:
-                conn.sendall(pickle.dumps(self.predecessor))
-            except Exception:
-                pass
-        # Lookup (type 3): return [flag, addr]
-        elif connectionType == 3:
-            self.lookupID(conn, addr, req)
-        # Update successor/pred (type 4)
-        elif connectionType == 4:
-            if req[1] == 1:
-                self.updateSucc(req)
-            else:
-                self.updatePred(req)
-        # Update finger table request (type 5) -> returns my successor
-        elif connectionType == 5:
-            self.updateFTable()
-            try:
-                conn.sendall(pickle.dumps(self.successor))
-            except Exception:
-                pass
-        # Request successor list (type:6)
-        elif connectionType == 6:
-            try:
-                conn.sendall(pickle.dumps(self.successor_list))
-            except Exception:
-                pass
-        else:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
-
- # -------------------- Join / Leave --------------------
-    def sendJoinRequest(self, ip, port):
-        bootstrap = (ip, port)
-        #ask bootstrap for successor of node's id
-        succ = self.getSuccessor(bootstrap, self.id)
-        self.successor = succ
-        self.successor_id = getHash(addr)
-        rpc_send(self.successor, ['notify', self.address])
-        if not recv:
-            print("Couldn't connect to bootstrap")
-            return
-        try:
-            peerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            peerSocket.settimeout(3.0)
-            peerSocket.connect(recv)
-            peerSocket.sendall(pickle.dumps([0, self.address]))
-            resp = recv_all(peerSocket)
-            peerSocket.close()
-            if resp:
-                oldPred = resp[0]
-                self.predecessor = oldPred
-                self.predecessor_id = getHash(f"{oldPred[0]}:{oldPred[1]}")
-            self.successor = recv
-            self.successor_id = getHash(f"{recv[0]}:{recv[1]}")
-            # tell predecessor to update its successor to me
-            if self.predecessor:
-                rpc_send(self.predecessor, [4, 1, self.address])
-            self.updateFTable()
-            self.updateOtherFTables()
-            print("Joined network. pred:", self.predecessor, "succ:", self.successor)
-        except Exception as e:
-            print("sendJoinRequest error:", e)
-    
-    def leaveNetwork(self):
-        try:
-            if self.successor and self.successor != self.address:
-                rpc_send(self.successor, [4, 0, self.predecessor])
-            if self.predecessor and self.predecessor != self.address:
-                rpc_send(self.predecessor, [4, 1, self.successor])
-        except Exception:
-            pass
-
-        # replicate files to successor
-        if self.filename_list and self.successor and self.successor != self.address:
-            for filename in list(self.filename_list):
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(5)
-                    s.connect(self.successor)
-                    s.sendall(pickle.dumps([1, 1, filename]))  # replicate flag = 1
-                    resp = recv_all(s)
-                    with open(filename, 'rb') as f:         #read as binary since files can be jpeg, audio
-                        while True:
-                            chunk = f.read(RECV_BUFFER)
-                            if not chunk:
-                                break
-                            s.sendall(chunk)
-                    s.close()
-                    print("Replicated", filename, "to", self.successor)
-                except Exception:
-                    print("Replication failed for", filename)
+        # ID generation based on Port for simplicity in local testing
+        # In real scenarios, use IP:Port string
+        self.id = get_sha1_hash(f"{self.ip}:{self.port}")
+        
+        # Chord State
+        self.finger_table = {}  # Map: i -> (node_id, address)
         self.predecessor = None
-        self.predecessor_id = self.id
-        self.successor = self.address
-        self.successor_id = self.id
-        self.successor_list = [self.address]
-        self.finger_table.clear()
-        print(self.address, "left network.")
+        self.successor = (self.id, self.address) # (id, (ip, port))
+        
+        # File Storage (Simulating Disk)
+        self.storage_path = f"node_storage_{self.id}"
+        if not os.path.exists(self.storage_path):
+            os.makedirs(self.storage_path)
 
-# -------------------- Lookup logic --------------------
-    def lookupID(self, conn, addr, req):
-        """Handle lookup requests (type 3). Reply with [flag, address]."""
-        keyID = req[1]
-        with self.lock:
-            if self.id == keyID or (self.predecessor and self.predecessor_id < keyID <= self.id) or (self.predecessor and self.id < self.predecessor_id and (keyID > self.predecessor_id or keyID <= self.id)):
-                #flag 0 => I am the successor
-                try:
-                    conn.sendall(pickle.dumps([0, self.address]))
-                except Exception:
-                    pass
-                return
-            #only node in network
-            if self.successor == self.address:
-                try:
-                    conn.sendall(pickle.dumps([0, self.address]))
-                except Exception:
-                    pass
-                return
-            # find closest preceding node for keyID using finger table
-            candidate = None
-            for start, (nid, addr_entry) in reversed(self.finger_table.items()):
-                if nid is None:
-                    continue
-                if _is_between(self.id, nid, keyID):
-                    candidate = addr_entry
-                    break
-            if not candidate:
-                candidate = self.successor
-            try:
-                conn.sendall(pickle.dumps([1, candidate]))
-            except Exception:
-                pass
-            return
+        # Threading Flags
+        self.running = True
+        self.mutex = threading.Lock()
 
-    def getSuccessor(self, contact_addr, keyID):
-        return lookup_successor(self, contact_addr, keyID)
+        # --- Functionality: Networking Initialization ---
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(self.address)
+        self.server_socket.listen(10)
+        
+        print(f"[INIT] Node {self.id} started at {self.address}")
 
-# -------------------- Finger table maintenance --------------------
-    def updateFTable(self):
-        with self.lock:
-            self.finger_table.clear()
-            for i in range(self.m_bits):
-                start = (self.id + (2**i)) % MAX_NODES
-                #find successor for start
-                if self.successor == self.address:
-                    # only 1 node
-                    self.finger_table[start] = (self.id, self.address)
-                else:
-                    succ = self.getSuccessor(self.successor, start)
-                    if succ:
-                        succ_id = getHash(f"{succ[0]}:{succ[1]}")
-                        self.finger_table[start] = (succ_id, succ)
-                    else:
-                        # fallback: point to current successor
-                        self.finger_table[start] = (self.successor_id, self.successor)
-
-    def updateOtherFTables(self):
-        """Ask nodes around the ring to refresh (type 5)."""
-        visited = set()
-        here = self.successor
-        while here and here != self.address and here not in visited:
-            visited.add(here)
-            resp = rpc_send(here, [5])
-            if resp is None:
-                break
-            here = resp
-            if here == self.successor:
-                break
-
-    def fix_fingers_incremental(self):
-        """Fix one finger per call (incrementally)."""
-        with self.lock:
-            i = self.last_fix_index
-            start = (self.id + (2**i)) % MAX_NODES
-            if self.successor == self.address:
-                self.finger_table[start] = (self.id, self.address)
-            else:
-                succ = self.getSuccessor(self.successor, start)
-                if succ:
-                    succ_id = getHash(f"{succ[0]}:{succ[1]}")
-                    self.finger_table[start] = (succ_id, succ)
-            self.last_fix_index = (i + 1) % self.m_bits
- 
-
-    def stabilize(self):
-        """Periodically ensure successor/predecessor pointers are correct."""
-        try:
-            if self.successor == self.address:
-                update_successor_list(self)
-                return
-            resp = rpc_send(self.successor, [2])  # ping returns successor's predecessor
-            succ_pred = resp
-            if succ_pred:
-                succ_pred_id = getHash(f"{succ_pred[0]}:{succ_pred[1]}")
-                if _is_between(self.id, succ_pred_id, self.successor_id):
-                    self.successor = succ_pred
-                    self.successor_id = succ_pred_id
-            # notify the new succ to update the pred
-            rpc_send(self.successor, [4, 0, self.address])
-            update_successor_list(self)
-        except Exception:
-            # on any error, attempt to pick a new successor from successor_list
-            self._failover_successor()
-
-    def notify(self, candidate):
-        """Called remotely: when a node tells me 'I might be your predecessor'."""
-        with self.lock:
-            if self.predecessor is None:
-                self.predecessor = candidate
-                self.predecessor_id = getHash(f"{candidate[0]}:{candidate[1]}")
-                return
-            cand_id = getHash(f"{candidate[0]}:{candidate[1]}")
-            if _is_between(self.predecessor_id, cand_id, self.id):
-                self.predecessor = candidate
-                self.predecessor_id = cand_id
-
-    def _failover_successor(self):
-        """If current successor appears dead, pick next from successor_list or finger_table."""
-        with self.lock:
-            for s in self.successor_list:
-                if s and s != self.successor and s != self.address:
-                    if rpc_send(s, [2]) is not None:
-                        self.successor = s
-                        self.successor_id = getHash(f"{s[0]}:{s[1]}")
-                        break
-            else:
-                # fallback, single node
-                self.successor = self.address
-                self.successor_id = self.id
-                self.successor_list = [self.address]
-
-# -------------------- RPC update handlers --------------------
-    def updateSucc(self, req):
-        """Req format:[4, 1, newSucc]-> update successor"""
-        new_succ = req[2]
-        self.successor = new_succ
-        self.successor_id = getHash(f"{new_succ[0]}:{new_succ[1]}")
-        update_successor_list(self)
-
-    def updatePred(self, req):
-        """Req format:[4, 0, newPred] -> update my predecessor"""
-        new_pred = req[2]
-        self.predecessor = new_pred
-        self.predecessor_id = getHash(f"{new_pred[0]}:{new_pred[1]}")
-
-# -------------------- Maintenance loops --------------------
-    def stabilize_loop(self):
-        while not self.stop:
-            try:
-                self.stabilize()
-            except Exception:
-                pass
-            time.sleep(STABILIZE_INTERVAL)
-
-    def fix_fingers_loop(self):
-        while not self.stop:
-            try:
-                self.fix_fingers_incremental()
-            except Exception:
-                pass
-            time.sleep(FIX_FINGERS_INTERVAL)
-
-    def start_background(self):
+        # Join the network if a known node is provided
+        if known_node_ip and known_node_port:
+            self.join(known_node_ip, int(known_node_port))
+        else:
+            # First node in the ring
+            print(f"[NETWORK] Created new Chord Ring.")
+        
+        # Start Threads
+        threading.Thread(target=self.start_server, daemon=True).start()
         threading.Thread(target=self.stabilize_loop, daemon=True).start()
         threading.Thread(target=self.fix_fingers_loop, daemon=True).start()
-        threading.Thread(target=self.pingSucc_loop, daemon=True).start()
+        threading.Thread(target=self.check_predecessor_loop, daemon=True).start()
+        
+        # Start User Interface
+        self.user_interface()
 
-# -------------------- Ping-based fail detection using successor_list --------------------
-    def pingSucc_loop(self):
-        while not self.stop:
-            time.sleep(PING_INTERVAL)
-            if self.successor == self.address:
-                continue
+    # ==============================================================================
+    # MODULE 2: NETWORKING LAYER
+    # Handles low-level socket operations and object serialization
+    # ==============================================================================
+    
+    def start_server(self):
+        """
+        Listens for incoming TCP connections from other nodes or clients.
+        """
+        while self.running:
             try:
-                resp = rpc_send(self.successor, [2])  # ping -> returns predecessor
-                if resp is None:
-                    # failover
-                    print("\nDetected offline successor; attempting failover...")
-                    self._failover_successor()  #new succ 
-                    # inform new successor to update its pred
-                    if self.successor and self.successor != self.address:
-                        rpc_send(self.successor, [4, 0, self.address])
-                        self.updateFTable()
-                        self.updateOtherFTables()
-            except Exception:
-                continue
+                conn, addr = self.server_socket.accept()
+                threading.Thread(target=self.handle_connection, args=(conn, addr)).start()
+            except Exception as e:
+                print(f"[ERROR] Server error: {e}")
 
-# -------------------- Helpers --------------------
-    def print_menu(self):
-        print("\n1. Join Network\n2. Leave Network\n3. Upload File\n4. Download File")
-        print("5. Print Finger Table\n6. Print my predecessor and successor\n")
-
-    def printFTable(self):
-        print("Printing F Table")
-        for key, value in self.finger_table.items():
-            print("StartID:", key, " -> ", value)
-
-    def stop(self):
-        self.stop = True
+    def send_request(self, target_address, message):
+        """
+        Sends a pickled message to a target node with a STRICT TIMEOUT.
+        """
         try:
-            self.server.close()
-        except Exception:
-            pass
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # CRITICAL FIX: Add a timeout. 
+            # If a node doesn't reply in 3 seconds, assume it's dead.
+            sock.settimeout(3) 
+            
+            sock.connect(target_address)
+            sock.sendall(pickle.dumps(message))
+            
+            response_data = sock.recv(BUFFER_SIZE)
+            sock.close()
+            
+            if response_data:
+                return pickle.loads(response_data)
+        except Exception as e:
+            # Connection refused, timeout, or host unreachable
+            return None
+        return None
 
-# -------------------- Run as script --------------------
-if __name__ == "__main__":
-    ip = DEFAULT_IP
-    port = DEFAULT_PORT
-    if len(sys.argv) >= 3:
-        ip = sys.argv[1]
-        port = int(sys.argv[2])
-    elif len(sys.argv) == 2:
-        port = int(sys.argv[1])
+    def handle_connection(self, conn, addr):
+        """
+        Routes incoming requests to appropriate DHT or File logic.
+        """
+        try:
+            data = conn.recv(BUFFER_SIZE)
+            if not data: return
+            
+            request = pickle.loads(data)
+            cmd = request.get('cmd')
+            response = {'status': 'ERROR', 'msg': 'Unknown Command'}
 
-    node = Node(ip, port)
-    print("Node started:", node.address, "ID:", node.id)
-    # start server threads
-    threading.Thread(target=node.listen_loop, daemon=True).start()
-    node.start_background()
+            # --- DHT Routing Commands ---
+            if cmd == 'FIND_SUCCESSOR':
+                result_node = self.find_successor(request['id'])
+                response = {'status': 'OK', 'node': result_node}
+            
+            elif cmd == 'GET_PREDECESSOR':
+                response = {'status': 'OK', 'node': self.predecessor}
+            
+            elif cmd == "PING":
+                response = {'status': 'OK'}
 
-    # simple interactive loop (non-blocking)
-    try:
-        while True:
-            node.print_menu()
-            cmd = input("> ").strip()
-            if cmd == "1":
-                b_ip = input("Bootstrap IP: ").strip() or DEFAULT_IP
-                b_port = int(input("Bootstrap Port: ").strip() or DEFAULT_PORT)
-                node.sendJoinRequest(b_ip, b_port)
-            elif cmd == "2":
-                node.leaveNetwork()
-            elif cmd == "3":
-                fname = input("Filename to upload: ").strip()
-                # find responsible node for this filename
-                fileID = getHash(fname)
-                recv = node.getSuccessor(node.successor, fileID)
-                if recv:
-                    # call filemanager upload helper
-                    filemanager.upload_file(node, fname, recv, replicate=True)
+            elif cmd == 'NOTIFY':
+                self.notify(request['node'])
+                response = {'status': 'OK'}
+            
+            # --- File Management Commands ---
+            elif cmd == 'STORE_FILE':
+                self.handle_store_file(request)
+                response = {'status': 'OK', 'msg': 'File stored'}
+            
+            elif cmd == 'RETRIEVE_FILE':
+                response = self.handle_retrieve_file(request)
+                
+            elif cmd == 'MIGRATE_DATA':
+                self.handle_migration(request['data'])
+                response = {'status': 'OK'}
+
+            conn.sendall(pickle.dumps(response))
+        except Exception as e:
+            print(f"[ERROR] Handling connection: {e}")
+        finally:
+            conn.close()
+
+    # ==============================================================================
+    # MODULE 3: DHT PROTOCOL (CHORD LOGIC)
+    # Core logic for routing, joining, and stabilization
+    # ==============================================================================
+
+    def join(self, ip, port):
+        """
+        Functionality: Node Join
+        Bootstrap by asking a known node to find my successor.
+        """
+        print(f"[DHT] Joining network via {ip}:{port}...")
+        known_address = (ip, port)
+        response = self.send_request(known_address, {'cmd': 'FIND_SUCCESSOR', 'id': self.id})
+        
+        if response and response['status'] == 'OK':
+            self.successor = response['node']
+            print(f"[DHT] Join Successful. Successor is Node {self.successor[0]}")
+            
+            # Functionality: Data Migration on Join
+            # Ask successor for keys that now belong to me
+            # (Simplified implementation triggers in stabilize/notify usually, 
+            # but explicit request can be added here)
+        else:
+            print("[DHT] Failed to find successor. Running as standalone.")
+
+    def find_successor(self, id):
+        """
+        Functionality: File Lookup / Routing
+        Finds the node responsible for a specific ID.
+        """
+        if self.is_between(id, self.id, self.successor[0], inclusive_end=True):
+            return self.successor
+        else:
+            n0 = self.closest_preceding_node(id)
+            if n0[0] == self.id:
+                return self.successor
+            
+            # Recursive / Forwarding call
+            response = self.send_request(n0[1], {'cmd': 'FIND_SUCCESSOR', 'id': id})
+            if response and response['status'] == 'OK':
+                return response['node']
+            return self.successor # Fallback
+    
+    def check_predecessor_loop(self):
+        """
+        Periodically checks if predecessor is alive.
+        """
+        while self.running:
+            try:
+                if self.predecessor:
+                    resp = self.send_request(self.predecessor[1], {'cmd': 'PING'})
+                    if resp is None:
+                        print(f"[DETECTED] Predecessor {self.predecessor[0]} failed. Clearing.")
+                        self.predecessor = None
+            except Exception:
+                pass
+            time.sleep(3)
+
+    def closest_preceding_node(self, id):
+        """
+        Scans finger table (from furthest to nearest) to find best next hop.
+        """
+        for i in range(M - 1, -1, -1):
+            if i in self.finger_table:
+                node = self.finger_table[i]
+                if node and self.is_between(node[0], self.id, id):
+                    return node
+        return (self.id, self.address)
+
+    def is_between(self, id, start, end, inclusive_end=False):
+        """
+        Helper for circular ID space logic.
+        """
+        if start < end:
+            return (start < id <= end) if inclusive_end else (start < id < end)
+        else: # Wrapping around 0
+            return (start < id) or (id <= end) if inclusive_end else (start < id) or (id < end)
+
+    def stabilize_loop(self):
+        """
+        Final Robust Stabilization: Handles 1-node, 2-node, and N-node failures.
+        """
+        while self.running:
+            try:
+                # 1. PING SUCCESSOR
+                # If I am my own successor, I don't need to ping myself (optimization),
+                # but I DO need to check for new nodes (GET_PREDECESSOR).
+                response = self.send_request(self.successor[1], {'cmd': 'GET_PREDECESSOR'})
+                
+                if response is None:
+                    print(f"[DETECTED] Successor {self.successor[0]} failed. Initiating repair...")
+                    
+                    # --- FAILOVER LOGIC ---
+                    found_backup = False
+                    
+                    # Get all unique nodes from finger table, excluding myself
+                    # Use a set to remove duplicates, then convert to list
+                    candidates = []
+                    for idx in self.finger_table:
+                        node = self.finger_table[idx]
+                        # Only add if it's not me and not the dead successor
+                        if node[0] != self.id and node[0] != self.successor[0]:
+                             candidates.append(node)
+                    
+                    # Sort candidates? (Optional, but simple is better here)
+                    # We just need ONE alive node.
+                    
+                    for cand in candidates:
+                        print(f"[REPAIR] Trying candidate {cand[0]}...")
+                        if self.send_request(cand[1], {'cmd': 'PING'}):
+                            print(f"[REPAIR] Success! New successor is {cand[0]}")
+                            self.successor = cand
+                            found_backup = True
+                            break
+                    
+                    if not found_backup:
+                        # If we are here, Successor is dead, and Finger Table is either empty
+                        # or all dead. We are the last node.
+                        if self.successor[0] != self.id:
+                            print(f"[REPAIR] All known nodes dead. Reverting to Self-Loop (ID: {self.id}).")
+                            self.successor = (self.id, self.address)
+                            # Also clear finger table to prevent retrying dead nodes immediately
+                            self.finger_table = {} 
+                
                 else:
-                    print("Could not find successor to upload.")
-            elif cmd == "4":
-                fname = input("Filename to download: ").strip()
-                filemanager.download_file(node, fname)
-            elif cmd == "5":
-                node.updateFTable()
-                node.printFTable()
-            elif cmd == "6":
-                print("ID:", node.id, "Pred:", node.predecessor, node.predecessor_id, "Succ:", node.successor, node.successor_id)
-            elif cmd in ("quit", "exit"):
-                node.stop()
-                break
+                    # --- STANDARD CHORD LOGIC (Successor is Alive) ---
+                    x = response['node']
+                    if x:
+                        # If successor is self, take x.
+                        if self.successor[0] == self.id:
+                            self.successor = x
+                        # If x is strictly between me and my successor
+                        elif self.is_between(x[0], self.id, self.successor[0]):
+                            self.successor = x
+                            
+                    # Notify successor
+                    self.send_request(self.successor[1], {'cmd': 'NOTIFY', 'node': (self.id, self.address)})
+                    
+            except Exception as e:
+                print(f"[ERROR] In stabilize: {e}")
+            
+            time.sleep(3)
+
+    def notify(self, node):
+        """
+        Update predecessor if the notifying node is a better predecessor.
+        """
+        if self.predecessor is None or self.is_between(node[0], self.predecessor[0], self.id):
+            self.predecessor = node
+            # Trigger migration check here (simplified) logic usually goes here
+
+    def fix_fingers_loop(self):
+        """
+        Functionality: Optimized Finger Table Repair
+        Periodically updates random finger table entries.
+        """
+        i = 0
+        while self.running:
+            try:
+                i = (i + 1) % M
+                target_id = (self.id + 2**i) % (2**M)
+                node = self.find_successor(target_id)
+                if node:
+                    self.finger_table[i] = node
+            except Exception:
+                pass
+            time.sleep(1)
+
+    # ==============================================================================
+    # MODULE 4: FILE MANAGER
+    # Handles storage, retrieval, migration, integrity, and encryption
+    # ==============================================================================
+
+    def handle_store_file(self, request):
+        """
+        Saves encrypted file data to local storage.
+        """
+        filename = request['filename']
+        enc_data = request['data']
+        file_hash = request['hash']
+        
+        # Verify integrity before storing (if we were verifying on receipt)
+        # Note: We store encrypted data directly.
+        
+        path = os.path.join(self.storage_path, filename)
+        
+        # Metadata storage (simple text file sidecar)
+        meta_path = path + ".meta"
+        with open(meta_path, "w") as f:
+            f.write(f"Owner: {request['owner']}\nHash: {file_hash}\nSize: {len(enc_data)}")
+
+        with open(path, "wb") as f:
+            f.write(enc_data)
+        
+        print(f"[FILE] Stored file '{filename}' (ID: {request['key_id']})")
+
+    def handle_retrieve_file(self, request):
+        """
+        Reads file from disk and returns it.
+        """
+        filename = request['filename']
+        path = os.path.join(self.storage_path, filename)
+        
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                data = f.read()
+            
+            # Read metadata to get original hash
+            meta_hash = "UNKNOWN"
+            if os.path.exists(path + ".meta"):
+                with open(path + ".meta", "r") as f:
+                    for line in f:
+                        if line.startswith("Hash:"):
+                            meta_hash = line.split(":")[1].strip()
+
+            return {'status': 'OK', 'data': data, 'hash': meta_hash}
+        else:
+            return {'status': 'ERROR', 'msg': 'File not found'}
+
+    def handle_migration(self, incoming_data_dict):
+        """
+        Functionality: Data Migration on Join
+        Receive bulk files from a node (usually on Join).
+        """
+        for filename, file_data in incoming_data_dict.items():
+            path = os.path.join(self.storage_path, filename)
+            with open(path, "wb") as f:
+                f.write(file_data)
+        print(f"[MIGRATION] Received {len(incoming_data_dict)} files.")
+
+    def upload_file(self, filepath):
+        """
+        Client Action: Upload a file.
+        1. Integrity Hash -> 2. Encrypt -> 3. Locate Node -> 4. Send
+        """
+        if not os.path.exists(filepath):
+            print("File does not exist.")
+            return
+
+        filename = os.path.basename(filepath)
+        key_id = get_sha1_hash(filename)
+        
+        # 1. Integrity Check
+        with open(filepath, "rb") as f:
+            raw_data = f.read()
+        file_hash = SecurityUtils.calculate_file_hash(raw_data)
+        
+        # 2. End-to-End Encryption
+        encrypted_data = SecurityUtils.encrypt_data(raw_data)
+        
+        # 3. Locate Node
+        print(f"[UPLOAD] Hashed '{filename}' to ID {key_id}. Locating host...")
+        target_node = self.find_successor(key_id)
+        
+        # 4. Send
+        payload = {
+            'cmd': 'STORE_FILE',
+            'key_id': key_id,
+            'filename': filename,
+            'data': encrypted_data,
+            'hash': file_hash,
+            'owner': self.id
+        }
+        
+        print(f"[UPLOAD] Sending to Node {target_node[0]} at {target_node[1]}...")
+        response = self.send_request(target_node[1], payload)
+        if response and response['status'] == 'OK':
+            print("[UPLOAD] Success.")
+        else:
+            print("[UPLOAD] Failed.")
+
+    def download_file(self, filename):
+        """
+        Client Action: Download a file.
+        1. Locate Node -> 2. Fetch -> 3. Decrypt -> 4. Verify Integrity
+        """
+        key_id = get_sha1_hash(filename)
+        
+        # 1. Locate Node
+        print(f"[DOWNLOAD] Locating host for '{filename}' (ID {key_id})...")
+        target_node = self.find_successor(key_id)
+        
+        # 2. Fetch
+        payload = {'cmd': 'RETRIEVE_FILE', 'filename': filename}
+        response = self.send_request(target_node[1], payload)
+        
+        if response and response['status'] == 'OK':
+            enc_data = response['data']
+            original_hash = response['hash']
+            
+            # 3. Decrypt
+            dec_data = SecurityUtils.decrypt_data(enc_data)
+            
+            # 4. Verify Integrity
+            current_hash = SecurityUtils.calculate_file_hash(dec_data)
+            
+            if current_hash == original_hash:
+                save_name = f"downloaded_{self.id}_{filename}"
+                with open(save_name, "wb") as f:
+                    f.write(dec_data)
+                print(f"[DOWNLOAD] Success. Integrity Verified. Saved as '{save_name}'")
             else:
-                print("Unknown command.")
-    except KeyboardInterrupt:
-        node.stop()
-        print("Exiting.")
+                print(f"[SECURITY WARNING] Hash mismatch! File may be corrupted or tampered.")
+                print(f"Expected: {original_hash}")
+                print(f"Calculated: {current_hash}")
+        else:
+            print("[DOWNLOAD] File not found or Node unreachable.")
+
+    # ==============================================================================
+    # MODULE 5: APP INTERFACE
+    # CLI Menu for user interaction
+    # ==============================================================================
+    
+    def user_interface(self):
+        print("\n" + "="*40)
+        print(f" SECURE CHORD NODE {self.id} ")
+        print("="*40)
+        print("Commands: upload <file> | download <file> | info | exit")
+        
+        while self.running:
+            try:
+                cmd_input = input(f"\nNode-{self.id} > ").strip().split()
+                if not cmd_input: continue
+                
+                cmd = cmd_input[0].lower()
+                
+                if cmd == 'upload' and len(cmd_input) > 1:
+                    self.upload_file(cmd_input[1])
+                
+                elif cmd == 'download' and len(cmd_input) > 1:
+                    self.download_file(cmd_input[1])
+                
+                elif cmd == 'info':
+                    print(f"ID: {self.id}")
+                    print(f"Successor: {self.successor[0]}")
+                    print(f"Predecessor: {self.predecessor[0] if self.predecessor else 'None'}")
+                    print(f"Finger Table: {[f'{k}:{v[0]}' for k,v in self.finger_table.items()]}")
+                    files = os.listdir(self.storage_path)
+                    print(f"Stored Files: {files}")
+                
+                elif cmd == 'exit':
+                    self.running = False
+                    self.server_socket.close()
+                    sys.exit(0)
+                
+                else:
+                    print("Invalid command.")
+            
+            except KeyboardInterrupt:
+                self.running = False
+                sys.exit(0)
+            except Exception as e:
+                print(f"UI Error: {e}")
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python Node.py <MY_IP> <MY_PORT> [KNOWN_IP] [KNOWN_PORT]")
+        print("Example: python Node.py 192.168.1.5 5000")
+        sys.exit(1)
+        
+    my_ip = sys.argv[1]       # ARG 1: My own LAN IP
+    my_port = sys.argv[2]     # ARG 2: My own Port
+    
+    known_ip = None
+    known_port = None
+    
+    if len(sys.argv) > 4:
+        known_ip = sys.argv[3] # ARG 3: Known Node IP
+        known_port = sys.argv[4] # ARG 4: Known Node Port
+        
+    node = Node(my_ip, my_port, known_ip, known_port)
