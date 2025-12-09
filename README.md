@@ -1,4 +1,5 @@
-🏆 README.md: Secure Chord DHT Implementation
+🏆 README: 
+Secure Chord DHT Implementation
 This repository contains a modularized Python implementation of the Chord Distributed Hash Table (DHT) protocol, designed for secure, peer-to-peer (P2P) file storage and retrieval with strong fault tolerance.
 
 ✨ Features
