@@ -53,9 +53,10 @@ class NetworkManager:
             
             if response_data:
                 return pickle.loads(response_data)
-        except Exception:
-            return None # Timeout or Connection Refused
-        return None
+        except Exception as e:
+            print(f"[NET] send_request to {target_address} failed: {e}")
+            return None
+
 
     def stop(self):
         self.running = False

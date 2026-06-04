@@ -53,7 +53,15 @@ class FileManager:
         except json.JSONDecodeError:
             return {}
 
-    # --- Utility ---
+    def delete_file(self, filename: str) -> bool:
+        path = self._get_full_path(filename)
+        try:
+            if path.exists():
+                path.unlink()
+                return True
+        except OSError as e:
+            print(f"[FileManager] Error deleting file: {e}")
+        return False
+
     def list_files(self) -> List[str]:
-        """Lists filenames excluding .meta files."""
         return [f.name for f in self.base_path.glob("*") if f.is_file() and not f.name.endswith('.meta')]

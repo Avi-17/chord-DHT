@@ -2,6 +2,7 @@ import sys
 import time
 import threading
 import os
+import json
 
 from dht_utils import M, get_sha1_hash, is_between, SecurityUtils
 from filemanager import FileManager
@@ -128,6 +129,34 @@ class Node:
     def notify(self, node):
         if self.predecessor is None or is_between(node[0], self.predecessor[0], self.id):
             self.predecessor = node
+            self._migrate_keys_to_predecessor()
+
+    def _migrate_keys_to_predecessor(self):
+        """Transfer files that no longer belong to us to our new predecessor."""
+        if not self.predecessor or self.predecessor[0] == self.id:
+            return
+
+        files_to_migrate = {}
+        for filename in self.fm.list_files():
+            key_id = get_sha1_hash(filename)
+            # If this key is NOT in our range (predecessor, self], it belongs to predecessor
+            if not is_between(key_id, self.predecessor[0], self.id, inclusive_end=True):
+                data = self.fm.read_bytes(filename)
+                if data:
+                    files_to_migrate[filename] = data
+
+        if files_to_migrate:
+            payload = {'cmd': 'MIGRATE_DATA', 'data': files_to_migrate}
+            if self.net.send_request(self.predecessor[1], payload):
+                # Transfer metadata and clean up local copies
+                for filename in files_to_migrate:
+                    meta = self.fm.read_json(f"{filename}.meta")
+                    if meta:
+                        meta_payload = {'cmd': 'MIGRATE_DATA', 'data': {f"{filename}.meta": json.dumps(meta).encode()}}
+                        self.net.send_request(self.predecessor[1], meta_payload)
+                    self.fm.delete_file(filename)
+                    self.fm.delete_file(f"{filename}.meta")
+                print(f"[MIGRATION] Transferred {len(files_to_migrate)} file(s) to Node {self.predecessor[0]}")
 
     def fix_fingers_loop(self):
         i = 0
